@@ -15,6 +15,7 @@
 - **月收益榜单自动分析**
 - **智能组合过滤**（自动跳过表现不佳的组合）
 - **汇总报表生成**（Excel格式，包含多维度因子分析）
+- **候选组合管理**（自动筛选、更新、备份候选列表）
 
 ## 安装依赖
 
@@ -71,6 +72,30 @@ python analyst.py summary
 ```bash
 python analyst.py --help
 ```
+
+### 8. 自动更新候选组合
+```bash
+python update_choosen.py
+```
+自动更新候选组合列表，实现智能筛选和动态管理。
+
+**工作流程：**
+1. 更新现有候选组合的最新数据
+2. 获取年榜和月榜组合列表
+3. 批量分析榜单组合（自动过滤低质量组合）
+4. 按得分排序，筛选得分高于现有组合的新候选
+5. 保留前6名组合
+6. 原列表备份为 `history_{date}.csv`
+7. 新列表保存到 `choosen.csv`
+
+**筛选规则：**
+- 得分高于现有最低分的组合进入候选池
+- 按得分降序排列，保留前6名
+- 自动备份历史记录
+
+**相关文件：**
+- `choosen/choosen.csv` - 当前候选组合列表
+- `choosen/history_{date}.csv` - 历史备份文件
 
 ## 组合代码格式
 
@@ -138,13 +163,17 @@ python analyst.py --help
 
 ```
 cube_analyst/
-├── config.py          # 配置文件（包含URL模板和Cookie）
-├── data_loader.py     # 数据加载模块
-├── data_analyst.py    # 数据分析模块
-├── analyst.py         # 主入口文件
-├── requirements.txt   # 依赖包列表
-├── README.md         # 说明文档
-└── report/           # 报表输出目录（自动创建）
+├── config.py            # 配置文件（包含URL模板和Cookie）
+├── data_loader.py       # 数据加载模块
+├── data_analyst.py      # 数据分析模块
+├── analyst.py           # 主入口文件
+├── update_choosen.py    # 自动更新候选组合脚本
+├── requirements.txt     # 依赖包列表
+├── README.md           # 说明文档
+├── report/             # 报表输出目录（自动创建）
+└── choosen/            # 候选组合目录
+    ├── choosen.csv     # 当前候选组合列表
+    └── history_*.csv   # 历史备份文件
 ```
 
 ## 使用示例
@@ -175,6 +204,16 @@ python analyst.py summary
 
 # 第三步：查看生成的Excel文件
 # 文件位置：report/{日期}/summary_YYYYMMDD.xlsx
+```
+
+### 候选组合管理
+```bash
+# 一键更新候选组合列表
+python update_choosen.py
+
+# 查看结果
+# 当前列表：choosen/choosen.csv
+# 历史备份：choosen/history_YYYYMMDD.csv
 ```
 
 ## 注意事项
