@@ -1,7 +1,7 @@
 # 雪球组合数据分析工具
 
 这是一个用于分析雪球组合数据的工具，可以获取组合历史数据并进行各种指标分析，支持年榜、月榜自动分析和汇总报表生成。
-> - 使用前请先在config.py中设置你的雪球网站登录后的cookie值(方法请自行google)
+> - 使用前请把雪球登录 Cookie 写入 `~/agents_documents/xueqiu_cookies.txt`
 > - 有什么想法请提交Issues，我来帮你实现
 
 ## 功能特性
@@ -163,7 +163,7 @@ python update_choosen.py
 
 ```
 cube_analyst/
-├── config.py            # 配置文件（包含URL模板和Cookie）
+├── config.py            # 配置文件（API 地址；Cookie 从本地文件读取）
 ├── data_loader.py       # 数据加载模块
 ├── data_analyst.py      # 数据分析模块
 ├── analyst.py           # 主入口文件
@@ -218,7 +218,7 @@ python update_choosen.py
 
 ## 注意事项
 
-1. 使用前请确保 `config.py` 中的Cookie配置有效
+1. 使用前请确保 `~/agents_documents/xueqiu_cookies.txt` 中的 Cookie 有效
 2. 网络连接需要能够访问雪球网站
 3. 报表文件使用UTF-8编码，可用Excel打开
 4. 建议在分析前检查组合代码是否正确
@@ -227,7 +227,7 @@ python update_choosen.py
 
 ## 故障排除
 
-- **数据获取失败**：检查网络连接和Cookie配置
+- **数据获取失败**：检查网络连接和 `~/agents_documents/xueqiu_cookies.txt`。连续请求触发 WAF 时请稍后再试，客户端已限速并自动重试。
 - **组合代码无效**：确认代码格式为ZH或SP+6-7位数字
 - **报表生成失败**：检查磁盘空间和写入权限
 - **Excel文件无法打开**：确保安装了openpyxl库
