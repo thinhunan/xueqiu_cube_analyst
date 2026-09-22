@@ -5,8 +5,186 @@ import os
 import math
 import glob
 import re
-from data_loader import load_cube_data, load_rebalancing_history
+from data_loader import load_cube_data, load_rebalancing_history_with_retry
 from config import CUBE_LINK_URL, TRADE_COST
+from cube_store import load_summary_dataframe, save_cube_analysis
+
+RECENT_YEAR_DAYS = 365
+
+
+def get_one_year_ago():
+    """与月度「近一年」统计一致的时间窗口起点"""
+    return datetime.now() - timedelta(days=RECENT_YEAR_DAYS)
+
+
+def parse_rebalancing_timestamp_ms(record):
+    """从调仓记录解析毫秒时间戳"""
+    for field in ('created_at', 'updated_at', 'timestamp'):
+        ts = record.get(field)
+        if ts is None or ts == '':
+            continue
+        try:
+            return float(ts)
+        except (TypeError, ValueError):
+            continue
+    date_val = record.get('date')
+    if date_val is None or date_val == '':
+        return None
+    try:
+        if isinstance(date_val, (int, float)):
+            return float(date_val)
+        return pd.to_datetime(date_val).timestamp() * 1000
+    except (TypeError, ValueError):
+        return None
+
+
+def filter_recent_rebalancing_records(history_data):
+    """筛选近一年内的调仓记录"""
+    one_year_ago_ms = get_one_year_ago().timestamp() * 1000
+    recent = []
+    for item in history_data.get('list', []) or []:
+        ts = parse_rebalancing_timestamp_ms(item)
+        if ts is not None and ts >= one_year_ago_ms:
+            recent.append(item)
+    return recent
+
+
+def calculate_recent_year_nav_metrics(df):
+    """
+    计算近一年净值收益与交易日数
+
+    Returns:
+        tuple: (近一年收益率, 近一年交易日数)
+    """
+    one_year_ago = get_one_year_ago()
+    recent_df = df[df['date'] >= pd.Timestamp(one_year_ago)]
+    if len(recent_df) == 0:
+        recent_df = df
+    if len(recent_df) == 0:
+        return 0.0, 0
+
+    start_value = recent_df.iloc[0]['value']
+    end_value = recent_df.iloc[-1]['value']
+    recent_return = (end_value / start_value - 1.0) if start_value > 0 else 0.0
+    return recent_return, len(recent_df)
+
+
+def calculate_rebalancing_trade_metrics(recent_count, recent_return):
+    """根据近一年收益与调仓次数计算每次调仓收益率"""
+    if recent_count > 0 and recent_return > -1:
+        return math.pow(1 + recent_return, 1.0 / recent_count) - 1
+    return 0.0
+
+
+def calculate_daily_rebalancing_and_interval(recent_count, recent_trading_days):
+    """计算近一年日均调仓次数与自然日调仓间隔"""
+    if recent_trading_days > 0 and recent_count > 0:
+        daily_rate = recent_count / recent_trading_days
+        interval = 1 / daily_rate / 5 * 7
+        return daily_rate, interval
+    return 0.0, None
+
+
+def estimate_rebalance_turnover_ratio(rec):
+    """
+    估算单次调仓成交额占组合净值比例。
+
+    Σ|Δ权重| 同时计入买入与卖出两侧，实际成交额为其一半。
+    """
+    weight_delta = 0.0
+    for item in rec.get('rebalancing_histories') or []:
+        try:
+            prev_weight = float(item.get('prev_weight') or item.get('prev_target_weight') or 0)
+            target_weight = float(item.get('target_weight') or item.get('weight') or 0)
+        except (TypeError, ValueError):
+            continue
+        weight_delta += abs(target_weight - prev_weight)
+    return weight_delta / 200.0
+
+
+def get_nav_at(df, ts_ms):
+    """获取不晚于调仓时刻的最近净值"""
+    if df is None or len(df) == 0 or ts_ms is None or ts_ms <= 0:
+        return None
+    target = pd.Timestamp(datetime.fromtimestamp(ts_ms / 1000))
+    sub = df[df['date'] <= target]
+    if sub.empty:
+        return float(df.iloc[0]['value'])
+    return float(sub.iloc[-1]['value'])
+
+
+def calculate_simulated_return_with_turnover(df, history_data):
+    """
+    全历史模拟实仓收益：沿净值曲线走，每次调仓仅对换手金额扣 TRADE_COST。
+
+    与总收益同口径（全历史），无调仓记录时退化为净值总收益。
+    """
+    if df is None or len(df) == 0:
+        return 0.0
+
+    records = history_data.get('list', []) or []
+    df = df.sort_values('date').reset_index(drop=True)
+
+    events = []
+    for rec in records:
+        ts = parse_rebalancing_timestamp_ms(rec)
+        if ts is not None:
+            events.append((ts, rec))
+    events.sort(key=lambda x: x[0])
+
+    if not events:
+        start_nav = float(df.iloc[0]['value'])
+        end_nav = float(df.iloc[-1]['value'])
+        return (end_nav / start_nav - 1.0) if start_nav > 0 else 0.0
+
+    equity = 1.0
+    prev_nav = float(df.iloc[0]['value'])
+    if prev_nav <= 0:
+        return 0.0
+
+    for ts, rec in events:
+        curr_nav = get_nav_at(df, ts)
+        if curr_nav is None or prev_nav <= 0:
+            continue
+        equity *= curr_nav / prev_nav
+        turnover = estimate_rebalance_turnover_ratio(rec)
+        equity *= max(0.0, 1.0 - turnover * TRADE_COST)
+        prev_nav = curr_nav
+
+    final_nav = float(df.iloc[-1]['value'])
+    if prev_nav > 0:
+        equity *= final_nav / prev_nav
+
+    return equity - 1.0
+
+
+def extract_last_rebalancing_date(history_data):
+    """从调仓历史中提取最后一次调仓日期"""
+    list_data = history_data.get('list', []) if history_data else []
+    if not list_data:
+        return None
+
+    last_rebalancing = list_data[0]
+    ts = parse_rebalancing_timestamp_ms(last_rebalancing)
+    if ts is not None:
+        try:
+            return datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+        except (OSError, ValueError):
+            pass
+
+    for field in ('created_at', 'timestamp', 'date'):
+        if field not in last_rebalancing:
+            continue
+        val = last_rebalancing.get(field)
+        if not val:
+            continue
+        try:
+            if isinstance(val, (int, float)):
+                return datetime.fromtimestamp(val / 1000).strftime('%Y-%m-%d')
+            return pd.to_datetime(val).strftime('%Y-%m-%d')
+        except (TypeError, ValueError, OSError):
+            continue
+    return None
 
 
 def calculate_daily_changes(data):
@@ -214,7 +392,7 @@ def calculate_monthly_metrics(df):
     down_months = len(monthly_df[monthly_df['monthly_change'] < 0])
     
     # 计算最近一年的统计数据
-    one_year_ago = datetime.now() - timedelta(days=365)
+    one_year_ago = get_one_year_ago()
     recent_monthly_df = monthly_df.copy()
     recent_monthly_df['date'] = pd.to_datetime(recent_monthly_df['year_month'])
     recent_monthly_df = recent_monthly_df[recent_monthly_df['date'] >= one_year_ago]
@@ -303,88 +481,113 @@ def calculate_monthly_metrics(df):
 
 def calculate_rebalancing_return(df, history_data):
     """
-    计算调仓收益率
-    
-    Args:
-        df (pd.DataFrame): 包含daily_change的DataFrame
-        history_data (dict): 调仓历史数据
-        
-    Returns:
-        dict: 包含调仓相关指标的字典
+    计算调仓相关指标
+
+    - 模拟实仓收益率：全历史净值 + 按换手金额扣费（对应总收益）
+    - 日均调仓次数 / 调仓间隔 / 每次调仓收益率：近一年口径
     """
+    empty_metrics = {
+        'total_rebalancing_count': 0,
+        'recent_rebalancing_count': 0,
+        'recent_trading_days': 0,
+        'total_return': 0,
+        'recent_return': 0,
+        'rebalancing_return_rate': 0,
+        'simulated_return': 0,
+        'daily_rebalancing_rate': 0,
+        'rebalancing_interval': None,
+        'last_rebalancing_date': None,
+    }
+
     if df is None or len(df) == 0:
-        return {}
-    
-    # 如果history_data为空，返回空结果但保留结构
-    if not history_data:
-        return {
-            'total_rebalancing_count': 0,
-            'rebalancing_return_rate': 0,
-            'last_rebalancing_date': None
-        }
-    
-    # 提取totalCount（总调仓次数）
+        return empty_metrics.copy()
+
+    history_data = history_data or {}
     total_count = history_data.get('totalCount', 0)
-    
-    # 提取最后调仓日期
-    last_rebalancing_date = None
-    list_data = history_data.get('list', [])
-    if list_data and len(list_data) > 0:
-        # 获取最后一次调仓记录（通常第一条是最新的）
-        last_rebalancing = list_data[0]
-        # 尝试从不同可能的字段中获取日期
-        if 'created_at' in last_rebalancing:
-            timestamp = last_rebalancing.get('created_at')
-            if timestamp:
-                try:
-                    last_rebalancing_date = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d')
-                except:
-                    pass
-        elif 'timestamp' in last_rebalancing:
-            timestamp = last_rebalancing.get('timestamp')
-            if timestamp:
-                try:
-                    last_rebalancing_date = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d')
-                except:
-                    pass
-        elif 'date' in last_rebalancing:
-            date_str = last_rebalancing.get('date')
-            if date_str:
-                try:
-                    # 尝试解析日期字符串
-                    if isinstance(date_str, (int, float)):
-                        last_rebalancing_date = datetime.fromtimestamp(date_str / 1000).strftime('%Y-%m-%d')
-                    else:
-                        # 尝试直接解析日期字符串
-                        date_obj = pd.to_datetime(date_str)
-                        last_rebalancing_date = date_obj.strftime('%Y-%m-%d')
-                except:
-                    pass
-    
-    if total_count == 0:
-        return {
-            'total_rebalancing_count': 0, 
-            'rebalancing_return_rate': 0,
-            'last_rebalancing_date': last_rebalancing_date
-        }
-    
-    # 计算总收益：最后的value - 1
+    last_rebalancing_date = extract_last_rebalancing_date(history_data)
+
     final_value = df.iloc[-1]['value']
     total_return = final_value - 1.0
-    
-    # 计算每次调仓的收益率：(1+x)^totalCount = 1 + totalReturn
-    # 求解 x = (1 + totalReturn)^(1/totalCount) - 1
-    if total_count > 0 and total_return > -1:  # 确保总收益大于-100%
-        rebalancing_return_rate = math.pow(1 + total_return, 1.0 / total_count) - 1
-    else:
-        rebalancing_return_rate = 0
-    
+
+    recent_records = filter_recent_rebalancing_records(history_data)
+    recent_count = len(recent_records)
+    recent_return, recent_trading_days = calculate_recent_year_nav_metrics(df)
+    rebalancing_return_rate = calculate_rebalancing_trade_metrics(recent_count, recent_return)
+    daily_rebalancing_rate, rebalancing_interval = calculate_daily_rebalancing_and_interval(
+        recent_count, recent_trading_days
+    )
+    simulated_return = calculate_simulated_return_with_turnover(df, history_data)
+
     return {
         'total_rebalancing_count': total_count,
+        'recent_rebalancing_count': recent_count,
+        'recent_trading_days': recent_trading_days,
         'total_return': total_return,
+        'recent_return': recent_return,
         'rebalancing_return_rate': rebalancing_return_rate,
-        'last_rebalancing_date': last_rebalancing_date
+        'simulated_return': simulated_return,
+        'daily_rebalancing_rate': daily_rebalancing_rate,
+        'rebalancing_interval': rebalancing_interval,
+        'last_rebalancing_date': last_rebalancing_date,
     }
+
+
+def build_analysis_record(cube_symbol, cube_name, metrics, rebalancing_metrics):
+    """将分析结果组装为汇总/入库用的结构化记录（含因子）。"""
+    monthly_df = metrics.get("monthly_data")
+    monthly_changes = []
+    last_monthly_change = 0.0
+    if monthly_df is not None and not monthly_df.empty:
+        sorted_df = monthly_df.sort_values("year_month")
+        monthly_changes = sorted_df["monthly_change"].tolist()
+        last_monthly_change = float(sorted_df.iloc[-1]["monthly_change"])
+
+    record = {
+        "symbol": cube_symbol,
+        "name": cube_name,
+        "link": CUBE_LINK_URL.replace("<cube_symbol>", cube_symbol),
+        "total_return": rebalancing_metrics.get("total_return", 0),
+        "simulated_return": rebalancing_metrics.get("simulated_return", 0),
+        "total_months": metrics.get("total_months", 0),
+        "total_days": metrics.get("total_days", 0),
+        "monthly_avg_change": metrics.get("monthly_avg_change", 0),
+        "recent_monthly_avg_change": metrics.get("recent_monthly_avg_change", 0),
+        "daily_rebalancing_rate": rebalancing_metrics.get("daily_rebalancing_rate", 0),
+        "rebalancing_interval": rebalancing_metrics.get("rebalancing_interval"),
+        "rebalancing_return_rate": rebalancing_metrics.get("rebalancing_return_rate", 0),
+        "recent_return": rebalancing_metrics.get("recent_return", 0),
+        "total_rebalancing_count": rebalancing_metrics.get("total_rebalancing_count", 0),
+        "recent_rebalancing_count": rebalancing_metrics.get("recent_rebalancing_count", 0),
+        "recent_trading_days": rebalancing_metrics.get("recent_trading_days", 0),
+        "recent_max_monthly_gain": metrics.get("recent_max_monthly_gain", 0),
+        "recent_max_monthly_drawdown": metrics.get("recent_max_monthly_drawdown", 0),
+        "recent_max_continuous_monthly_gain": metrics.get("recent_max_continuous_monthly_gain", 0),
+        "recent_max_continuous_monthly_gain_months": metrics.get(
+            "recent_max_continuous_monthly_gain_months", 0
+        ),
+        "recent_max_continuous_monthly_drawdown": metrics.get(
+            "recent_max_continuous_monthly_drawdown", 0
+        ),
+        "recent_max_continuous_monthly_drawdown_months": metrics.get(
+            "recent_max_continuous_monthly_drawdown_months", 0
+        ),
+        "recent_up_months": metrics.get("recent_up_months", 0),
+        "recent_down_months": metrics.get("recent_down_months", 0),
+        "max_monthly_gain": metrics.get("max_monthly_gain", 0),
+        "max_monthly_drawdown": metrics.get("max_monthly_drawdown", 0),
+        "max_continuous_monthly_gain": metrics.get("max_continuous_monthly_gain", 0),
+        "max_continuous_monthly_gain_months": metrics.get("max_continuous_monthly_gain_months", 0),
+        "max_continuous_monthly_drawdown": metrics.get("max_continuous_monthly_drawdown", 0),
+        "max_continuous_monthly_drawdown_months": metrics.get(
+            "max_continuous_monthly_drawdown_months", 0
+        ),
+        "up_months": metrics.get("up_months", 0),
+        "down_months": metrics.get("down_months", 0),
+        "last_monthly_change": last_monthly_change,
+        "last_rebalancing_date": rebalancing_metrics.get("last_rebalancing_date"),
+    }
+    record.update(calculate_factors(record, monthly_changes))
+    return record
 
 
 def generate_report(cube_symbol, apply_skip_filters=True):
@@ -406,11 +609,11 @@ def generate_report(cube_symbol, apply_skip_filters=True):
         print("数据加载失败")
         return None
     
-    # 加载调仓历史数据
-    history_data = load_rebalancing_history(cube_symbol)
-    if not history_data:
-        print("调仓历史数据加载失败，将使用空数据")
-        history_data = {}  # 使用空字典而不是None，以便后续处理
+    # 加载调仓历史数据（分页拉取全历史，失败重试）
+    history_data = load_rebalancing_history_with_retry(cube_symbol)
+    if not history_data or not history_data.get('list'):
+        print(f"调仓历史数据加载失败: {cube_symbol}，模拟实仓收益将退化为净值总收益")
+        history_data = {}
     
     # 2. 计算每日变化
     df = calculate_daily_changes(data)
@@ -430,7 +633,7 @@ def generate_report(cube_symbol, apply_skip_filters=True):
     # 如果调仓历史数据为空但需要获取最后调仓日期，尝试重新加载
     if not rebalancing_metrics.get('last_rebalancing_date') and not history_data:
         try:
-            history_data_retry = load_rebalancing_history(cube_symbol)
+            history_data_retry = load_rebalancing_history_with_retry(cube_symbol)
             if history_data_retry:
                 # 只提取最后调仓日期
                 list_data = history_data_retry.get('list', [])
@@ -451,8 +654,9 @@ def generate_report(cube_symbol, apply_skip_filters=True):
     # 5. 检查是否需要跳过（在计算完所有指标后进行判断）
     # 指定组合分析时(apply_skip_filters=False)不受收益率等限制，不进行跳过
     if apply_skip_filters:
-        rebalancing_return_rate = rebalancing_metrics.get('rebalancing_return_rate', 0)
+        simulated_return = rebalancing_metrics.get('simulated_return', 0)
         total_rebalancing_count = rebalancing_metrics.get('total_rebalancing_count', 0)
+        daily_rebalancing_rate = rebalancing_metrics.get('daily_rebalancing_rate', 0)
         total_days = metrics.get('total_days', 0)
         total_months = metrics.get('total_months', 0)
         monthly_avg_change = metrics.get('monthly_avg_change', 0)
@@ -467,24 +671,22 @@ def generate_report(cube_symbol, apply_skip_filters=True):
             print(f"跳过组合 {cube_symbol}: 交易月数不足6个月: {total_months}")
             return "SKIP"
 
-        # 计算日均调仓次数
-        daily_rebalancing_rate = total_rebalancing_count / total_days if total_days > 0 else 0
-
-        # 检查条件3：日均调仓次数超过1
+        # 检查条件3：近一年日均调仓次数超过1
         if daily_rebalancing_rate > 1:
-            print(f"跳过组合 {cube_symbol}: 日均调仓次数超过1: {daily_rebalancing_rate:.4f}")
+            print(f"跳过组合 {cube_symbol}: 近一年日均调仓次数超过1: {daily_rebalancing_rate:.4f}")
             return "SKIP"
 
-        # 检查条件4：模拟实盘收益为负
-        if total_rebalancing_count > 0:
-            simulated_return = math.pow(1 + rebalancing_return_rate - TRADE_COST, total_rebalancing_count) - 1
-            if simulated_return < 0:
-                print(f"跳过组合 {cube_symbol}: 模拟实盘收益为负: {simulated_return:.4%}")
-                return "SKIP"
+        # 检查条件4：全历史模拟实盘收益为负（与总收益同口径，按换手扣费）
+        if total_rebalancing_count > 0 and simulated_return < 0:
+            print(f"跳过组合 {cube_symbol}: 模拟实盘收益为负: {simulated_return:.4%}")
+            return "SKIP"
 
         # 检查条件5：总调仓次数大于交易日数
         if total_rebalancing_count > total_days:
-            print(f"跳过组合 {cube_symbol}: 调仓次数({total_rebalancing_count})大于交易日数({total_days})")
+            print(
+                f"跳过组合 {cube_symbol}: 调仓次数({total_rebalancing_count})"
+                f"大于交易日数({total_days})"
+            )
             return "SKIP"
 
         # 检查条件6：月均涨跌幅小于4%
@@ -498,8 +700,21 @@ def generate_report(cube_symbol, apply_skip_filters=True):
         print(f"组合 {cube_symbol}: 已关停或数据为空，无法生成报表")
         return None
     
-    # 4. 生成报表内容
+    # 4. 写入 SQLite 并生成报表
     report_date = datetime.now().strftime('%Y%m%d')
+
+    cube_name = "N/A"
+    if data and len(data) > 0:
+        cube_name = data[0].get('name', 'N/A')
+
+    analysis_record = build_analysis_record(
+        cube_symbol, cube_name, metrics, rebalancing_metrics
+    )
+    save_cube_analysis(
+        analysis_record,
+        metrics.get("monthly_data"),
+        analyzed_date=report_date,
+    )
     
     # 创建报表目录 - 使用日期子目录
     report_dir = os.path.join('report', report_date)
@@ -615,22 +830,33 @@ def generate_report(cube_symbol, apply_skip_filters=True):
         "总调仓次数", "","",str(rebalancing_metrics.get('total_rebalancing_count', 0))
     ])
     report_lines.append([
+        "近一年调仓次数", "","",str(rebalancing_metrics.get('recent_rebalancing_count', 0))
+    ])
+    report_lines.append([
+        "近一年交易日数", "","",str(rebalancing_metrics.get('recent_trading_days', 0))
+    ])
+    report_lines.append([
         "总收益率", "","",f"{rebalancing_metrics.get('total_return', 0):.4%}"
+    ])
+    report_lines.append([
+        "近一年收益率", "","",f"{rebalancing_metrics.get('recent_return', 0):.4%}"
     ])
     report_lines.append([
         "每次调仓收益率","","", f"{rebalancing_metrics.get('rebalancing_return_rate', 0):.6%}"
     ])
+
+    daily_rebalancing_rate = rebalancing_metrics.get('daily_rebalancing_rate', 0)
+    rebalancing_interval = rebalancing_metrics.get('rebalancing_interval')
+    report_lines.append([
+        "日均调仓次数", "","", f"{daily_rebalancing_rate:.6f}"
+    ])
+    report_lines.append([
+        "调仓间隔(自然日)", "","",
+        f"{rebalancing_interval:.4f}" if rebalancing_interval is not None else "N/A"
+    ])
     
-    # 计算模拟实仓收益率
-    rebalancing_return_rate = rebalancing_metrics.get('rebalancing_return_rate', 0)
-    total_rebalancing_count = rebalancing_metrics.get('total_rebalancing_count', 0)
-    
-    if total_rebalancing_count > 0:
-        # 模拟实仓收益率 = (1 + 每次调仓收益率 - 交易成本)^总调仓次数 - 1
-        simulated_return = math.pow(1 + rebalancing_return_rate - TRADE_COST, total_rebalancing_count) - 1
-    else:
-        simulated_return = 0
-    
+    # 模拟实仓收益率：全历史净值路径，按换手金额比例扣费
+    simulated_return = rebalancing_metrics.get('simulated_return', 0)
     report_lines.append([
         "模拟实仓收益率","","", f"{simulated_return:.4%}"
     ])
@@ -646,11 +872,6 @@ def generate_report(cube_symbol, apply_skip_filters=True):
     report_lines.append([
         "组合代码","","", cube_symbol
     ])
-    
-    # 获取组合名称
-    cube_name = "N/A"
-    if data and len(data) > 0:
-        cube_name = data[0].get('name', 'N/A')
     
     report_lines.append([
         "组合名称","","", cube_name
@@ -727,10 +948,23 @@ def parse_csv_report(file_path):
                     result['recent_monthly_avg_change'] = float(value.replace('%', '')) / 100 if value else 0
                 elif key == "总调仓次数":
                     result['total_rebalancing_count'] = int(value) if value.isdigit() else 0
+                elif key == "近一年调仓次数":
+                    result['recent_rebalancing_count'] = int(value) if value.isdigit() else 0
+                elif key == "近一年交易日数":
+                    result['recent_trading_days'] = int(value) if value.isdigit() else 0
+                elif key == "近一年收益率":
+                    result['recent_return'] = float(value.replace('%', '')) / 100 if value else 0
                 elif key == "交易日数":
                     result['total_days'] = int(value) if value.isdigit() else 0
                 elif key == "每次调仓收益率":
                     result['rebalancing_return_rate'] = float(value.replace('%', '')) / 100 if value else 0
+                elif key == "日均调仓次数":
+                    result['daily_rebalancing_rate'] = float(value) if value else 0
+                elif key == "调仓间隔(自然日)":
+                    if value and value != 'N/A':
+                        result['rebalancing_interval'] = float(value)
+                    else:
+                        result['rebalancing_interval'] = None
                 elif key == "近一年最大月涨幅":
                     result['recent_max_monthly_gain'] = float(value.replace('%', '')) / 100 if value else 0
                 elif key == "近一年最大月回撤":
@@ -801,25 +1035,27 @@ def parse_csv_report(file_path):
         # 保存最后月涨幅
         result['last_monthly_change'] = last_monthly_change if last_monthly_change is not None else 0
         
-        # 计算日均调仓次数
-        if result.get('total_rebalancing_count', 0) > 0 and result.get('total_days', 0) > 0:
-            result['daily_rebalancing_rate'] = result['total_rebalancing_count'] / result['total_days']
-        else:
-            result['daily_rebalancing_rate'] = 0
-        
-        # 计算调仓间隔(自然日)：1 / 日均调仓次数 / 5 * 7
-        if result.get('daily_rebalancing_rate', 0) > 0:
-            result['rebalancing_interval'] = 1 / result['daily_rebalancing_rate'] / 5 * 7
-        else:
-            result['rebalancing_interval'] = None  # 如果没有调仓，间隔为None
+        # 兼容旧报表：若无近一年字段则从全历史数据推算
+        if 'daily_rebalancing_rate' not in result:
+            recent_count = result.get('recent_rebalancing_count')
+            recent_days = result.get('recent_trading_days')
+            if recent_count is None:
+                recent_count = result.get('total_rebalancing_count', 0)
+            if recent_days is None:
+                recent_days = result.get('total_days', 0)
+            daily_rate, interval = calculate_daily_rebalancing_and_interval(
+                recent_count, recent_days
+            )
+            result['daily_rebalancing_rate'] = daily_rate
+            if 'rebalancing_interval' not in result:
+                result['rebalancing_interval'] = interval
         
         # 如果最后调仓日期不存在或为空，尝试从API重新获取
         if not result.get('last_rebalancing_date') or result.get('last_rebalancing_date') == 'N/A':
             symbol = result.get('symbol')
             if symbol:
                 try:
-                    from data_loader import load_rebalancing_history
-                    history_data = load_rebalancing_history(symbol)
+                    history_data = load_rebalancing_history_with_retry(symbol)
                     if history_data:
                         list_data = history_data.get('list', [])
                         if list_data and len(list_data) > 0:
@@ -957,143 +1193,108 @@ def calculate_stability_factor(monthly_changes):
     return stability_factor
 
 
-def generate_summary_report():
+def _parse_monthly_df_from_csv(file_path):
+    """从组合 CSV 报表解析月度统计块。"""
+    rows = []
+    try:
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) < 14:
+                    continue
+                year_month = parts[0].strip()
+                if not year_month or year_month == "年月":
+                    continue
+                if len(year_month) != 7 or year_month[4] != "-":
+                    continue
+                try:
+                    rows.append({
+                        "year_month": year_month,
+                        "month_start_value": float(parts[1]),
+                        "month_end_value": float(parts[2]),
+                        "monthly_change": float(parts[3].replace("%", "")) / 100,
+                        "avg_daily_change": float(parts[4].replace("%", "")) / 100,
+                        "max_daily_change": float(parts[5].replace("%", "")) / 100,
+                        "max_daily_drawdown": float(parts[6].replace("%", "")) / 100,
+                        "max_continuous_gain": float(parts[7].replace("%", "")) / 100,
+                        "max_continuous_drawdown": float(parts[8].replace("%", "")) / 100,
+                        "max_value": float(parts[9]),
+                        "min_value": float(parts[10]),
+                        "amplitude": float(parts[11].replace("%", "")) / 100,
+                        "up_days": int(parts[12]),
+                        "down_days": int(parts[13]),
+                    })
+                except (TypeError, ValueError):
+                    continue
+    except OSError:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def _load_summary_from_csv_fallback(today_date):
+    """兼容旧流程：从当天 CSV 解析汇总，并回填 SQLite。"""
+    report_base_dir = "report"
+    today_dir = os.path.join(report_base_dir, today_date)
+    if not os.path.isdir(today_dir):
+        return pd.DataFrame()
+
+    csv_files = glob.glob(os.path.join(today_dir, "*.csv"))
+    if not csv_files:
+        return pd.DataFrame()
+
+    symbol_files = {}
+    for file_path in csv_files:
+        filename = os.path.basename(file_path)
+        match = re.match(r"^([A-Z0-9]+)_(\d{8})\.csv$", filename)
+        if match:
+            symbol = match.group(1)
+            date_str = match.group(2)
+            date_obj = datetime.strptime(date_str, "%Y%m%d")
+            if symbol not in symbol_files or date_obj > symbol_files[symbol]["date"]:
+                symbol_files[symbol] = {"file_path": file_path, "date": date_obj}
+
+    saved = 0
+    for symbol, file_info in symbol_files.items():
+        file_path = file_info["file_path"]
+        data = parse_csv_report(file_path)
+        if data:
+            monthly_df = _parse_monthly_df_from_csv(file_path)
+            save_cube_analysis(data, monthly_df if not monthly_df.empty else None, analyzed_date=today_date)
+            saved += 1
+
+    if saved == 0:
+        return pd.DataFrame()
+
+    print(f"从 CSV 回填 SQLite: {saved} 个组合")
+    return load_summary_dataframe(today_date)
+
+
+def generate_summary_report(run_date=None):
     """
-    生成汇总报表
+    从 SQLite 生成汇总报表，并导出 Excel（兼容旧流程）。
     
     Returns:
         str: 汇总文件路径，如果失败返回None
     """
-    print("开始生成汇总报表...")
-    
-    # 获取当天日期目录下的CSV文件
-    report_base_dir = 'report'
-    if not os.path.exists(report_base_dir):
-        print("报表目录不存在")
+    print("开始生成汇总报表（数据来源: SQLite）...")
+
+    today_date = run_date or datetime.now().strftime('%Y%m%d')
+    df = load_summary_dataframe(today_date)
+
+    if df.empty:
+        print(f"SQLite 中未找到 {today_date} 的汇总数据，尝试从当天 CSV 回填...")
+        df = _load_summary_from_csv_fallback(today_date)
+
+    if df.empty:
+        print("没有可用的汇总数据")
         return None
-    
-    # 获取当天日期
-    today_date = datetime.now().strftime('%Y%m%d')
-    today_dir = os.path.join(report_base_dir, today_date)
-    
-    # 只搜索当天日期目录下的CSV文件
-    csv_files = []
-    if os.path.exists(today_dir) and os.path.isdir(today_dir):
-        date_csv_files = glob.glob(os.path.join(today_dir, '*.csv'))
-        csv_files.extend(date_csv_files)
-        print(f"搜索当天目录: {today_dir}")
-    else:
-        print(f"当天目录不存在: {today_dir}")
-        return None
-    
-    if not csv_files:
-        print(f"当天目录 {today_date} 下未找到任何报表文件")
-        return None
-    
-    print(f"找到 {len(csv_files)} 个报表文件（仅当天目录）")
-    
-    # 按symbol分组，处理同一天可能有多个同名文件的情况
-    symbol_files = {}
-    for file_path in csv_files:
-        filename = os.path.basename(file_path)
-        # 解析文件名格式：SYMBOL_YYYYMMDD.csv
-        match = re.match(r'^([A-Z0-9]+)_(\d{8})\.csv$', filename)
-        if match:
-            symbol = match.group(1)
-            date_str = match.group(2)
-            date_obj = datetime.strptime(date_str, '%Y%m%d')
-            
-            # 如果是同一天的文件，选择最新的（虽然通常只有一个）
-            if symbol not in symbol_files or date_obj > symbol_files[symbol]['date']:
-                symbol_files[symbol] = {
-                    'file_path': file_path,
-                    'date': date_obj,
-                    'date_str': date_str
-                }
-    
-    print(f"找到 {len(symbol_files)} 个唯一组合")
-    
-    # 解析所有报表
-    summary_data = []
-    for symbol, file_info in symbol_files.items():
-        print(f"解析组合 {symbol} 的报表...")
-        data = parse_csv_report(file_info['file_path'])
-        if data:
-            summary_data.append(data)
-        else:
-            print(f"跳过组合 {symbol}：解析失败")
-    
-    if not summary_data:
-        print("没有成功解析任何报表")
-        return None
-    
-    print(f"成功解析 {len(summary_data)} 个组合的报表")
-    
-    # 创建汇总DataFrame
-    df = pd.DataFrame(summary_data)
-    
-    # 重新排列列的顺序
-    columns_order = [
-        'link', 'name', 'last_rebalancing_date', 'last_monthly_change', 'total_return', 'simulated_return', 'total_months', 
-        'monthly_avg_change', 'recent_monthly_avg_change', 'daily_rebalancing_rate', 'rebalancing_interval',
-        'rebalancing_return_rate', 'recent_max_monthly_gain', 'recent_max_monthly_drawdown',
-        'recent_max_continuous_monthly_gain', 'recent_max_continuous_monthly_gain_months',
-        'recent_max_continuous_monthly_drawdown', 'recent_max_continuous_monthly_drawdown_months',
-        'recent_up_months', 'recent_down_months', 'max_monthly_gain', 'max_monthly_drawdown',
-        'max_continuous_monthly_gain', 'max_continuous_monthly_gain_months',
-        'max_continuous_monthly_drawdown', 'max_continuous_monthly_drawdown_months',
-        'up_months', 'down_months', 'profitability_factor', 'stability_factor',
-        'efficiency_factor', 'persistence_factor', 'total_score'
-    ]
-    
-    # 只保留存在的列
-    existing_columns = [col for col in columns_order if col in df.columns]
-    df = df[existing_columns]
-    
-    # 重命名列为中文
-    column_mapping = {
-        'link': '组合链接',
-        'name': '组合名称',
-        'last_rebalancing_date': '最后调仓日期',
-        'last_monthly_change': '最后月涨幅',
-        'total_return': '总收益',
-        'simulated_return': '模拟实仓收益率',
-        'total_months': '交易月数',
-        'monthly_avg_change': '月均涨幅',
-        'recent_monthly_avg_change': '近年月均涨幅',
-        'daily_rebalancing_rate': '日均调仓次数',
-        'rebalancing_interval': '调仓间隔(自然日)',
-        'rebalancing_return_rate': '每次调仓收益率',
-        'recent_max_monthly_gain': '近年最大月涨幅',
-        'recent_max_monthly_drawdown': '近年最大月回撤',
-        'recent_max_continuous_monthly_gain': '近年最大连续涨幅',
-        'recent_max_continuous_monthly_gain_months': '近年最大连续上涨月数',
-        'recent_max_continuous_monthly_drawdown': '近年最大连续跌幅',
-        'recent_max_continuous_monthly_drawdown_months': '近年最大连续下跌月数',
-        'recent_up_months': '近年上涨月数',
-        'recent_down_months': '近年下跌月数',
-        'max_monthly_gain': '最大月涨幅',
-        'max_monthly_drawdown': '最大月回撤',
-        'max_continuous_monthly_gain': '最大连续涨幅',
-        'max_continuous_monthly_gain_months': '最大连续上涨月数',
-        'max_continuous_monthly_drawdown': '最大连续跌幅',
-        'max_continuous_monthly_drawdown_months': '最大连续下跌月数',
-        'up_months': '上涨月数',
-        'down_months': '下跌月数',
-        'profitability_factor': '盈利能力因子',
-        'stability_factor': '稳定因子',
-        'efficiency_factor': '交易效率因子',
-        'persistence_factor': '持久因子',
-        'total_score': '得分'
-    }
-    
-    df = df.rename(columns=column_mapping)
-    
-    # 生成Excel文件 - 保存到当前日期的子目录
-    summary_date = datetime.now().strftime('%Y%m%d')
+
+    print(f"汇总 {len(df)} 个组合（run_date={today_date}）")
+
+    report_base_dir = "report"
+    summary_date = today_date
     excel_filename = f"summary_{summary_date}.xlsx"
-    
-    # 创建当前日期的子目录
+
     current_report_dir = os.path.join(report_base_dir, summary_date)
     if not os.path.exists(current_report_dir):
         os.makedirs(current_report_dir)

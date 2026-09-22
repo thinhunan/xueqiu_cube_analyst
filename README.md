@@ -1,21 +1,18 @@
 # 雪球组合数据分析工具
 
-这是一个用于分析雪球组合数据的工具，可以获取组合历史数据并进行各种指标分析，支持年榜、月榜自动分析和汇总报表生成。
-> - 使用前请把雪球登录 Cookie 写入 `~/agents_documents/xueqiu_cookies.txt`
-> - 有什么想法请提交Issues，我来帮你实现
+用于分析雪球组合历史数据、计算多维度因子、管理候选列表，并同步到跟单系统。
+
+> 使用前请配置雪球 Cookie（见下方「配置」）。  
+> 有需求请提交 Issues。
 
 ## 功能特性
 
-- 自动获取雪球组合历史数据
-- 计算每日涨跌比例
-- 生成月度分析报表
-- 计算回撤、波动率等风险指标
-- 支持交互式和批量分析模式
-- **年收益榜单自动分析**
-- **月收益榜单自动分析**
-- **智能组合过滤**（自动跳过表现不佳的组合）
-- **汇总报表生成**（Excel格式，包含多维度因子分析）
-- **候选组合管理**（自动筛选、更新、备份候选列表）
+- 自动获取组合净值与调仓历史（调仓历史 SQLite 增量缓存）
+- 月度统计、风险指标、调仓效率分析
+- 模拟实仓收益（全历史净值 + 按换手金额扣费）
+- 多维度因子评分与汇总排名
+- 候选组合自动筛选、备份、同步跟单
+- 分析结果写入 SQLite，汇总/选股从数据库生成
 
 ## 安装依赖
 
@@ -23,212 +20,237 @@
 pip install -r requirements.txt
 ```
 
-建议使用清华镜像源：
+建议使用清华镜像：
+
 ```bash
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
 ```
 
-## 使用方法
+## 配置
 
-### 1. 交互模式（推荐）
-```bash
-python analyst.py
-```
-程序会提示输入组合代码，支持连续分析多个组合。
+Cookie 从文件读取，**不是**写在 `config.py` 里：
 
-### 2. 单次分析
-```bash
-python analyst.py ZH3186221
 ```
-由于对素质差的组合进行了自动跳过，所以不进行跳过生成数据时，请需添加apply_skip_filters=False参数
-```bash
-python analyst.py ZH3186221 apply_skip_filters=False
+~/agents_documents/xueqiu_cookies.txt
 ```
 
-### 3. 批量分析
+将浏览器登录雪球后的 Cookie 整行粘贴到该文件即可。`config.py` 仅保留 API 地址、`TRADE_COST` 等常量。
+
+---
+
+## 推荐操作流程（最重要）
+
+### 每月例行更新（一条命令搞定）
+
 ```bash
-python analyst.py batch ZH3186221 ZH1234567 ZH7890123
+python update_choosen.py
 ```
 
-### 4. 年收益榜单分析
-```bash
-python analyst.py annual
-```
-自动获取年收益榜单，分析所有上榜组合并生成报表。
+这一条命令会**自动完成**：
 
-### 5. 月收益榜单分析
-```bash
-python analyst.py monthly
-```
-自动获取月收益榜单，分析所有上榜组合并生成报表。
+1. 拉取**年榜 + 月榜**组合
+2. 合并 `choosen/choosen.csv` 中原有选中，去重得到候选池
+3. 批量分析所有候选（写入 SQLite + 导出 CSV）
+4. 从 SQLite 生成当日汇总 Excel
+5. 按得分取前 6 名更新 `choosen.csv`（原列表备份为 `history_{date}.csv`）
+6. （可选）同步到 `xueqiu_follower` 并生成 `position_sync` 指令——**默认关闭**
 
-### 6. 汇总报表生成
+开启跟单同步：
+
+```bash
+python update_choosen.py --sync-follower
+```
+
+或在 `update_choosen.py` 顶部将 `ENABLE_FOLLOWER_SYNC = True`。
+
+定时任务可用：
+
+```bash
+python run_monthly_update.py
+```
+
+（内部调用 `update_choosen.main()`，并推送飞书通知。）
+
+### 还需要 `python analyst.py annual` 吗？
+
+| 场景 | 是否需要单独跑 annual / monthly |
+|------|--------------------------------|
+| **每月更新候选列表** | **不需要**。`update_choosen.py` 已内含年榜+月榜拉取与分析 |
+| 只想看榜单、用跳过规则过滤、**不更新 choosen** | 可以单独跑 `annual` / `monthly` |
+| 月中只刷新当前跟踪组合、重新出汇总 | 跑 `python analyst.py summary` |
+| 分析某一个指定组合 | `python analyst.py ZH3186221` |
+
+**结论：正常月度维护只跑 `update_choosen.py` 即可，不必再单独跑 annual。**
+
+---
+
+## 命令说明
+
+### 1. 月度选股（推荐主流程）
+
+```bash
+python update_choosen.py
+# 同时更新 follower 配置并生成 position_sync：
+python update_choosen.py --sync-follower
+```
+
+### 2. 刷新跟踪组合 + 汇总（不重新选股）
+
 ```bash
 python analyst.py summary
 ```
-对 `report/` 目录下的所有报表进行汇总，生成Excel格式的综合分析报表。支持新的日期子目录结构。
 
-### 7. 查看帮助
+流程：读取 `choosen/choosen.csv` → 刷新这些组合数据（SQLite）→ 从 SQLite 生成 `summary_{日期}.xlsx`。
+
+适用于月中只想更新已跟踪组合、不出新候选列表时。
+
+### 3. 交互式 / 单组合分析
+
+```bash
+python analyst.py                  # 交互模式
+python analyst.py ZH3186221        # 单组合（不过滤跳过规则需在代码里设 apply_skip_filters=False）
+python analyst.py batch ZH3186221 ZH1234567
+```
+
+### 4. 年榜 / 月榜单独分析（可选）
+
+```bash
+python analyst.py annual    # 年收益榜，应用跳过过滤
+python analyst.py monthly   # 月收益榜，应用跳过过滤
+```
+
+与 `update_choosen.py` 的区别：
+
+- `annual` / `monthly`：只分析榜单上的组合，**会跳过**表现不佳的组合，**不更新** choosen
+- `update_choosen.py`：年榜 ∪ 月榜 ∪ 原选中，**不过滤跳过**（公平比分数），再选前 6
+
+### 5. 帮助
+
 ```bash
 python analyst.py --help
 ```
 
-### 8. 自动更新候选组合
-```bash
-python update_choosen.py
+---
+
+## 数据存储（SQLite）
+
+分析结果持久化在 `data/` 目录（已加入 `.gitignore`）：
+
+| 文件 / 表 | 说明 |
+|-----------|------|
+| `data/rebalancing_history.db` | 调仓历史缓存；无数据全量拉，有数据增量拉到重复即停 |
+| `data/cube_analytics.db` → `cube_monthly` | 各组合按月统计 |
+| `data/cube_analytics.db` → `cube_metrics` | 基础指标、调仓指标、因子、得分 |
+| `data/cube_analytics.db` → `summary_snapshot` | 某日参与汇总的组合列表 |
+
+数据流：
+
 ```
-自动更新候选组合列表，实现智能筛选和动态管理。
+generate_report()  →  SQLite（主） + report/{日期}/*.csv（备查）
+generate_summary_report()  →  读 SQLite  →  summary_{日期}.xlsx
+update_choosen.py  →  读 SQLite 汇总  →  choosen.csv
+```
 
-**工作流程：**
-1. 更新现有候选组合的最新数据
-2. 获取年榜和月榜组合列表
-3. 批量分析榜单组合（自动过滤低质量组合）
-4. 按得分排序，筛选得分高于现有组合的新候选
-5. 保留前6名组合
-6. 原列表备份为 `history_{date}.csv`
-7. 新列表保存到 `choosen.csv`
+若当天 SQLite 无汇总数据，`generate_summary_report` 会尝试从当天 CSV **回填**数据库。
 
-**筛选规则：**
-- 得分高于现有最低分的组合进入候选池
-- 按得分降序排列，保留前6名
-- 自动备份历史记录
-
-**相关文件：**
-- `choosen/choosen.csv` - 当前候选组合列表
-- `choosen/history_{date}.csv` - 历史备份文件
+---
 
 ## 组合代码格式
 
-雪球组合代码格式为：`ZH` 或 `SP` + 6-7位数字，例如：`ZH3186221` 或 `SP1234567`
-- `ZH` 开头：模拟组合
-- `SP` 开头：实盘组合
+`ZH` 或 `SP` + 6～7 位数字，例如 `ZH3186221`、`SP1234567`。
 
-## 输出报表
+---
 
-### 1. 单个组合报表（CSV格式）
-分析完成后，会在 `report/{日期}/` 目录下生成CSV格式的报表文件，文件名格式为：`{组合代码}_{日期}.csv`
+## 指标口径摘要
 
-例如：`report/20251020/ZH3186221_20251020.csv`
+### 模拟实仓收益率
 
-#### 报表内容包括：
+- **时间范围**：全历史（与「总收益」对齐）
+- **扣费**：每次调仓按 `成交额占净值比例 × 0.068%`（非全仓扣费）
+- 成交额比例 ≈ `Σ|目标权重 − 原权重| / 200`
 
-1. **主要指标**
-   - 月均涨跌比例
-   - 近一年月均涨跌比例
-   - 月最大回撤
-   - 日最大回撤
-   - 日回撤累积
-   - 日均波动幅度
+### 调仓相关（近一年）
 
-2. **月度详细数据**
-   - 每月涨跌比例
-   - 月度波动率
-   - 月初/月末值等
+- 日均调仓次数、调仓间隔、每次调仓收益率：基于近一年调仓记录与近一年净值
 
-### 2. 汇总报表（Excel格式）
-使用 `python analyst.py summary` 命令生成，文件名格式为：`summary_{日期}.xlsx`
+### 得分
 
-#### 汇总报表包含以下字段：
+`盈利能力因子 + 持久因子×7 + 交易效率因子×3 + 稳定因子`
 
-**基础信息**
-- 组合链接、组合名称、总收益、模拟实仓收益率、交易月数
+### 跳过过滤（仅 `annual` / `monthly` / 默认 `generate_report`）
 
-**收益指标**
-- 月均涨幅、近年月均涨幅、日均调仓次数、每次调仓收益率
+以下组合不生成报表（`update_choosen` 分析时**不启用**跳过）：
 
-**风险指标**
-- 近年最大月涨幅、近年最大月回撤、最大月涨幅、最大月回撤
+- 交易月数 &lt; 6
+- 近一年日均调仓次数 &gt; 1
+- 全历史模拟实仓收益为负
+- 总调仓次数 &gt; 总交易日数
+- 月均涨跌幅 &lt; 4%
 
-**连续性指标**
-- 近年最大连续涨幅、近年最大连续上涨月数、近年最大连续跌幅、近年最大连续下跌月数
-- 最大连续涨幅、最大连续上涨月数、最大连续跌幅、最大连续下跌月数
+---
 
-**统计指标**
-- 近年上涨月数、近年下跌月数、上涨月数、下跌月数
+## 输出文件
 
-**多维度因子**
-- **盈利能力因子**：月均涨幅×8 + 近年月均涨幅×12
-- **稳定因子**：基于月涨幅曲线平滑度的加权评估
-- **交易效率因子**：基于次均收益的S型函数评估
-- **持久因子**：基于交易持续时间的对数标准化
-- **得分**：盈利能力因子 + 持久因子×7 + 交易效率因子×3 + 稳定因子
+| 路径 | 说明 |
+|------|------|
+| `report/{日期}/{代码}_{日期}.csv` | 单组合报表（含月度明细） |
+| `report/{日期}/summary_{日期}.xlsx` | 汇总 Excel（由 SQLite 生成） |
+| `choosen/choosen.csv` | 当前候选 Top 6 |
+| `choosen/history_{日期}.csv` | 历史备份 |
 
-### 3. 智能过滤机制
-在年榜和月榜分析中，程序会自动跳过以下类型的组合：
-- 模拟实盘收益为负的组合
-- 总调仓次数大于交易日数的组合
-- 月均涨跌幅小于4%的组合
+---
 
 ## 文件结构
 
 ```
-cube_analyst/
-├── config.py            # 配置文件（API 地址；Cookie 从本地文件读取）
-├── data_loader.py       # 数据加载模块
-├── data_analyst.py      # 数据分析模块
-├── analyst.py           # 主入口文件
-├── update_choosen.py    # 自动更新候选组合脚本
-├── requirements.txt     # 依赖包列表
-├── README.md           # 说明文档
-├── report/             # 报表输出目录（自动创建）
-└── choosen/            # 候选组合目录
-    ├── choosen.csv     # 当前候选组合列表
-    └── history_*.csv   # 历史备份文件
+xueqiu_cube_analyst/
+├── analyst.py              # CLI 入口
+├── update_choosen.py       # 月度选股主流程（推荐）
+├── run_monthly_update.py   # 定时任务 + 飞书通知
+├── data_loader.py          # 净值 / 榜单 / 调仓历史 API
+├── history_store.py        # 调仓历史 SQLite
+├── cube_store.py           # 分析结果 SQLite
+├── data_analyst.py         # 指标计算、报表、汇总
+├── sync_to_follower.py     # 同步跟单与指令
+├── config.py
+├── data/                   # SQLite 缓存（自动创建）
+├── report/                 # CSV / Excel 输出
+└── choosen/                # 候选列表
 ```
 
-## 使用示例
+---
 
-### 快速开始
+## 典型场景速查
+
 ```bash
-# 1. 分析单个组合
-python analyst.py ZH3186221
-
-# 2. 分析年收益榜单
-python analyst.py annual
-
-# 3. 分析月收益榜单
-python analyst.py monthly
-
-# 4. 生成汇总报表
-python analyst.py summary
-```
-
-### 典型工作流程
-```bash
-# 第一步：分析年榜和月榜
-python analyst.py annual
-python analyst.py monthly
-
-# 第二步：生成汇总报表
-python analyst.py summary
-
-# 第三步：查看生成的Excel文件
-# 文件位置：report/{日期}/summary_YYYYMMDD.xlsx
-```
-
-### 候选组合管理
-```bash
-# 一键更新候选组合列表
+# 场景 A：每月例行（年榜+月榜+选股+跟单）
 python update_choosen.py
 
-# 查看结果
-# 当前列表：choosen/choosen.csv
-# 历史备份：choosen/history_YYYYMMDD.csv
+# 场景 B：月中只刷新已跟踪 6 个组合的数据和汇总
+python analyst.py summary
+
+# 场景 C：临时看某个组合
+python analyst.py ZH3186221
+
+# 场景 D：单独扫年榜（不更新 choosen，带过滤）
+python analyst.py annual
 ```
+
+---
 
 ## 注意事项
 
-1. 使用前请确保 `~/agents_documents/xueqiu_cookies.txt` 中的 Cookie 有效
-2. 网络连接需要能够访问雪球网站
-3. 报表文件使用UTF-8编码，可用Excel打开
-4. 建议在分析前检查组合代码是否正确
-5. 汇总报表会自动选择每个组合的最新报表文件
-6. 年榜和月榜分析会自动过滤表现不佳的组合
+1. Cookie 过期会导致拉取失败，需更新 `~/agents_documents/xueqiu_cookies.txt`
+2. 调仓历史首次全量较慢，之后走增量缓存
+3. 若 `cube_metrics` 条数少于 API `totalCount`，可删除 `data/rebalancing_history.db` 后重拉
+4. Excel 依赖 `openpyxl`
 
 ## 故障排除
 
-- **数据获取失败**：检查网络连接和 `~/agents_documents/xueqiu_cookies.txt`。连续请求触发 WAF 时请稍后再试，客户端已限速并自动重试。
-- **组合代码无效**：确认代码格式为ZH或SP+6-7位数字
-- **报表生成失败**：检查磁盘空间和写入权限
-- **Excel文件无法打开**：确保安装了openpyxl库
-- **汇总报表为空**：检查report目录下是否有CSV报表文件（支持新的日期子目录结构）
+| 现象 | 处理 |
+|------|------|
+| 未找到 Cookie 文件 | 创建 `~/agents_documents/xueqiu_cookies.txt` |
+| 数据获取失败 / WAF 限频 | 检查网络和 Cookie；连续请求触发 WAF 时稍后再试，客户端已限速并自动重试 |
+| 汇总为空 | 先跑分析或 `update_choosen.py`；或确认当天 `summary_snapshot` 有数据 |
+| 调仓次数不准 / 为 0 | 检查调仓历史是否拉全；必要时删 `data/rebalancing_history.db` 重拉 |
+| Excel 打不开 | `pip install openpyxl` |

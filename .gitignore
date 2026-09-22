@@ -9,6 +9,15 @@ __pycache__/
 # 报表输出目录
 report/
 
+# 调仓历史本地缓存
+data/
+
+# 运行日志
+logs/
+
+# 本地工具锁
+.clawhub/
+
 # Virtual environments
 venv/
 .venv/

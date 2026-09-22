@@ -7,6 +7,7 @@
 
 from data_analyst import generate_report, generate_summary_report
 from data_loader import load_annual_rank_data, load_monthly_rank_data
+from update_choosen import load_choosen_data, update_existing_choosen
 import sys
 import re
 
@@ -212,13 +213,21 @@ def monthly_rank_analysis():
 
 def summary_analysis():
     """
-    汇总报表分析
+    汇总报表分析：先刷新 choosen.csv 中跟踪组合的数据，再合并当天报表生成汇总
     """
     print("=" * 60)
     print("汇总报表分析")
     print("=" * 60)
-    
-    # 生成汇总报表
+
+    choosen_df = load_choosen_data()
+    if not choosen_df.empty:
+        print(f"\n刷新 {len(choosen_df)} 个跟踪组合的最新数据...")
+        update_existing_choosen(choosen_df)
+    else:
+        print("\n未找到跟踪组合（choosen/choosen.csv 为空或不存在），跳过刷新")
+
+    print("\n" + "-" * 40)
+    # 生成汇总报表（合并当天 report 目录下所有 CSV）
     result = generate_summary_report()
     if result:
         print(f"汇总报表生成成功: {result}")
@@ -248,7 +257,7 @@ if __name__ == "__main__":
 5. 月收益榜单分析:
    python analyst.py monthly
 
-6. 汇总报表分析:
+6. 汇总报表分析（先刷新 choosen 跟踪组合，再合并汇总）:
    python analyst.py summary
 
 7. 帮助信息:

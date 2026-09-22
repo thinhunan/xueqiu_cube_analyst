@@ -22,7 +22,7 @@ REQUEST_RETRY_TIMES = 3
 CUBE_DATA_URL = XUEQIU_WEB_ORIGIN + "/cubes/nav_daily/all.json?cube_symbol=<cube_symbol>"
 HISTORY_DATA_URL = (
     XUEQIU_WEB_ORIGIN
-    + "/cubes/rebalancing/history.json?cube_symbol=<cube_symbol>&count=20&page=1"
+    + "/cubes/rebalancing/history.json?cube_symbol=<cube_symbol>&count=50&page=1"
 )
 CUBE_LINK_URL = "https://xueqiu.com/P/<cube_symbol>"
 TRADE_COST = 0.00068
