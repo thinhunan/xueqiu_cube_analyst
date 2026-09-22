@@ -10,13 +10,12 @@ def _load_cookie() -> str:
 
 COOKIE = _load_cookie()
 
-# 网页 API 必须直连 www。xueqiu.com 会 302 到 www，requests 跨 Host 会丢掉 Cookie 头。
+# 网页 API 走 www。浏览器客户端内用同源 fetch。
 XUEQIU_WEB_ORIGIN = "https://www.xueqiu.com"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
-REQUEST_INTERVAL = 2.0
 REQUEST_RETRY_TIMES = 3
 
 CUBE_DATA_URL = XUEQIU_WEB_ORIGIN + "/cubes/nav_daily/all.json?cube_symbol=<cube_symbol>"

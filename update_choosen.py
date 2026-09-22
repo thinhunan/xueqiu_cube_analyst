@@ -22,7 +22,6 @@ from typing import Any, Dict, Optional
 from data_analyst import generate_report, generate_summary_report
 from cube_store import load_summary_dataframe
 from data_loader import load_annual_rank_data, load_monthly_rank_data
-from sync_to_follower import sync_choosen_to_follower
 import re
 import glob
 
@@ -391,6 +390,8 @@ def main(enable_follower_sync: Optional[bool] = None) -> Dict[str, Any]:
     if enable_follower_sync:
         print("\n" + "=" * 60)
         print("同步到 xueqiu_follower 并生成 position_sync 指令...")
+        # 延迟导入：默认不同步时不依赖兄弟目录 position_sync
+        from sync_to_follower import sync_choosen_to_follower
         sync_res = sync_choosen_to_follower(new_choosen)
         result = _build_result(
             "ok" if sync_res.get("ok") else "error",
